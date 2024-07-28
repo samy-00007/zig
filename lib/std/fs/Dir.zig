@@ -1852,9 +1852,6 @@ pub const ReadLinkError = posix.ReadLinkError;
 /// Same as `File.stat`, but if the path points to a symbolic link,
 /// it will stat the link rather than the file it points to.
 pub fn statLink(self: Dir, sub_path: []const u8) !Stat {
-	if(native_os == .windows) {
-		@compileError("TODO: see if it is possible on windows");
-	}
     if (native_os == .wasi and !builtin.link_libc) {
         const st = try std.os.fstatat_wasi(self.fd, sub_path, .{ .SYMLINK_FOLLOW = false });
         return Stat.fromWasi(st);
@@ -1865,9 +1862,6 @@ pub fn statLink(self: Dir, sub_path: []const u8) !Stat {
 
 /// Same as `Dir.statLink`
 pub fn statLinkZ(self: Dir, sub_path_c: [*:0]const u8) !Stat {
-	if(native_os == .windows) {
-		@compileError("TODO: see if it possible on windows");
-	}
     if (native_os == .wasi and !builtin.link_libc) {
         const st = try std.os.fstatat_wasi(self.fd, mem.sliceTo(sub_path_c, 0), .{ .SYMLINK_FOLLOW = false });
         return Stat.fromWasi(st);
@@ -2660,11 +2654,6 @@ pub const StatFileError = File.OpenError || File.StatError || posix.FStatAtError
 /// On WASI, `sub_path` should be encoded as valid UTF-8.
 /// On other platforms, `sub_path` is an opaque sequence of bytes with no particular encoding.
 pub fn statFile(self: Dir, sub_path: []const u8) StatFileError!Stat {
-    if (native_os == .windows) {
-        var file = try self.openFile(sub_path, .{});
-        defer file.close();
-        return file.stat();
-    }
     if (native_os == .wasi and !builtin.link_libc) {
         const st = try std.os.fstatat_wasi(self.fd, sub_path, .{ .SYMLINK_FOLLOW = true });
         return Stat.fromWasi(st);

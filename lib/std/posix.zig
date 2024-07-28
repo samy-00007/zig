@@ -4355,7 +4355,8 @@ pub fn fstatat(dirfd: fd_t, pathname: []const u8, flags: u32) FStatAtError!Stat 
         });
         return Stat.fromFilestat(filestat);
     } else if (native_os == .windows) {
-        @compileError("fstatat is not yet implemented on Windows");
+        const path_w = try windows.sliceToPrefixedFileW(dirfd, pathname);
+        return fstatatW(dirfd, path_w.span().ptr, flags);
     } else {
         const pathname_c = try toPosixPath(pathname);
         return fstatatZ(dirfd, &pathname_c, flags);
@@ -4370,6 +4371,9 @@ pub fn fstatatZ(dirfd: fd_t, pathname: [*:0]const u8, flags: u32) FStatAtError!S
             .SYMLINK_FOLLOW = (flags & AT.SYMLINK_NOFOLLOW) == 0,
         });
         return Stat.fromFilestat(filestat);
+    } else if(native_os == .windows) {
+        const path_w = try windows.cStrToPrefixedFileW(dirfd, pathname);
+        return fstatatW(dirfd, path_w.span().ptr, flags);
     }
 
     const fstatat_sym = if (lfs64_abi) system.fstatat64 else system.fstatat;
@@ -4392,6 +4396,67 @@ pub fn fstatatZ(dirfd: fd_t, pathname: [*:0]const u8, flags: u32) FStatAtError!S
             return unexpectedErrno(err),
         else => |err| return unexpectedErrno(err),
     }
+}
+
+pub fn fstatatW(dirfd: fd_t, sub_path_w: [*:0]const u16, flags: u32) AccessError!Stat {
+    const path_len_bytes = cast(u16, mem.sliceTo(sub_path_w, 0).len * 2) orelse return error.NameTooLong;
+    var nt_name = windows.UNICODE_STRING{
+        .Length = path_len_bytes,
+        .MaximumLength = path_len_bytes,
+        .Buffer = @constCast(sub_path_w),
+    };
+    // open link directly
+    const attributes = if((flags & AT.SYMLINK_NOFOLLOW) == AT.SYMLINK_NOFOLLOW) windows.OBJ_OPENLINK else 0;
+    var attr = windows.OBJECT_ATTRIBUTES{
+        .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
+        .RootDirectory = if (fs.path.isAbsoluteWindowsW(sub_path_w)) null else dirfd,
+        .Attributes = attributes,
+        .ObjectName = &nt_name,
+        .SecurityDescriptor = null,
+        .SecurityQualityOfService = null,
+    };
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var info: windows.FILE_ALL_INFORMATION = undefined;
+
+    const rc = windows.ntdll.NtQueryInformationByName(&attr, &io_status_block, &info, @sizeOf(windows.FILE_ALL_INFORMATION), .FileAllInformation);
+    switch (rc) {
+        .SUCCESS => {},
+        // Buffer overflow here indicates that there is more information available than was able to be stored in the buffer
+        // size provided. This is treated as success because the type of variable-length information that this would be relevant for
+        // (name, volume name, etc) we don't care about.
+        .BUFFER_OVERFLOW => {},
+        .INVALID_PARAMETER => unreachable,
+        .ACCESS_DENIED => return error.AccessDenied,
+        else => return windows.unexpectedStatus(rc),
+    }
+    return .{
+        .inode = info.InternalInformation.IndexNumber,
+        .size = @as(u64, @bitCast(info.StandardInformation.EndOfFile)),
+        .mode = 0,
+        .kind = if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) reparse_point: {
+            var tag_info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
+            const tag_rc = windows.ntdll.NtQueryInformationByName(attr, &io_status_block, &tag_info, @sizeOf(windows.FILE_ATTRIBUTE_TAG_INFO), .FileAttributeTagInformation);
+            switch (tag_rc) {
+                .SUCCESS => {},
+                // INFO_LENGTH_MISMATCH and ACCESS_DENIED are the only documented possible errors
+                // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/d295752f-ce89-4b98-8553-266d37c84f0e
+                .INFO_LENGTH_MISMATCH => unreachable,
+                .ACCESS_DENIED => return error.AccessDenied,
+                else => return windows.unexpectedStatus(rc),
+            }
+            if (tag_info.ReparseTag & windows.reparse_tag_name_surrogate_bit != 0) {
+                break :reparse_point .sym_link;
+            }
+            // Unknown reparse point
+            break :reparse_point .unknown;
+        } else if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0)
+            .directory
+                else
+                    .file,
+                    .atime = windows.fromSysTime(info.BasicInformation.LastAccessTime),
+                    .mtime = windows.fromSysTime(info.BasicInformation.LastWriteTime),
+                    .ctime = windows.fromSysTime(info.BasicInformation.ChangeTime),
+                };
 }
 
 pub const KQueueError = error{
