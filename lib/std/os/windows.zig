@@ -3067,6 +3067,20 @@ pub const FILE_DISPOSITION_INFORMATION_EX = extern struct {
     Flags: ULONG,
 };
 
+pub const FILE_STAT_INFORMATION = extern struct {
+    FileId: LARGE_INTEGER,
+    CreationTime: LARGE_INTEGER,
+    LastAccessTime: LARGE_INTEGER,
+    LastWriteTime: LARGE_INTEGER,
+    ChangeTime: LARGE_INTEGER,
+    AllocationSize: LARGE_INTEGER,
+    EndOfFile: LARGE_INTEGER,
+    FileAttributes: ULONG,
+    ReparseTag: ULONG,
+    NumberOfLinks: ULONG,
+    EffectiveAccess: ACCESS_MASK,
+};
+
 const FILE_DISPOSITION_DO_NOT_DELETE: ULONG = 0x00000000;
 const FILE_DISPOSITION_DELETE: ULONG = 0x00000001;
 const FILE_DISPOSITION_POSIX_SEMANTICS: ULONG = 0x00000002;

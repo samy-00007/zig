@@ -480,8 +480,8 @@ pub const StatError = posix.FStatError;
 pub fn stat(self: File) StatError!Stat {
     if (builtin.os.tag == .windows) {
         var io_status_block: windows.IO_STATUS_BLOCK = undefined;
-        var info: windows.FILE_ALL_INFORMATION = undefined;
-        const rc = windows.ntdll.NtQueryInformationFile(self.handle, &io_status_block, &info, @sizeOf(windows.FILE_ALL_INFORMATION), .FileAllInformation);
+        var info: windows.FILE_STAT_INFORMATION = undefined;
+        const rc = windows.ntdll.NtQueryInformationFile(self.handle, &io_status_block, &info, @sizeOf(windows.FILE_STAT_INFORMATION), .FileStatInformation);
         switch (rc) {
             .SUCCESS => {},
             // Buffer overflow here indicates that there is more information available than was able to be stored in the buffer
@@ -493,32 +493,22 @@ pub fn stat(self: File) StatError!Stat {
             else => return windows.unexpectedStatus(rc),
         }
         return .{
-            .inode = info.InternalInformation.IndexNumber,
-            .size = @as(u64, @bitCast(info.StandardInformation.EndOfFile)),
+            .inode = info.FileId,
+            .size = @as(u64, @bitCast(info.EndOfFile)),
             .mode = 0,
-            .kind = if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) reparse_point: {
-                var tag_info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
-                const tag_rc = windows.ntdll.NtQueryInformationFile(self.handle, &io_status_block, &tag_info, @sizeOf(windows.FILE_ATTRIBUTE_TAG_INFO), .FileAttributeTagInformation);
-                switch (tag_rc) {
-                    .SUCCESS => {},
-                    // INFO_LENGTH_MISMATCH and ACCESS_DENIED are the only documented possible errors
-                    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/d295752f-ce89-4b98-8553-266d37c84f0e
-                    .INFO_LENGTH_MISMATCH => unreachable,
-                    .ACCESS_DENIED => return error.AccessDenied,
-                    else => return windows.unexpectedStatus(rc),
-                }
-                if (tag_info.ReparseTag & windows.reparse_tag_name_surrogate_bit != 0) {
+            .kind = if (info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) reparse_point: {
+                if (info.ReparseTag & windows.reparse_tag_name_surrogate_bit != 0) {
                     break :reparse_point .sym_link;
                 }
                 // Unknown reparse point
                 break :reparse_point .unknown;
-            } else if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0)
+            } else if (info.FileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0)
                 .directory
             else
                 .file,
-            .atime = windows.fromSysTime(info.BasicInformation.LastAccessTime),
-            .mtime = windows.fromSysTime(info.BasicInformation.LastWriteTime),
-            .ctime = windows.fromSysTime(info.BasicInformation.ChangeTime),
+            .atime = windows.fromSysTime(info.LastAccessTime),
+            .mtime = windows.fromSysTime(info.LastWriteTime),
+            .ctime = windows.fromSysTime(info.ChangeTime),
         };
     }
 
@@ -1019,9 +1009,9 @@ pub fn metadata(self: File) MetadataError!Metadata {
         .inner = switch (builtin.os.tag) {
             .windows => blk: {
                 var io_status_block: windows.IO_STATUS_BLOCK = undefined;
-                var info: windows.FILE_ALL_INFORMATION = undefined;
+                var info: windows.FILE_STAT_INFORMATION = undefined;
 
-                const rc = windows.ntdll.NtQueryInformationFile(self.handle, &io_status_block, &info, @sizeOf(windows.FILE_ALL_INFORMATION), .FileAllInformation);
+                const rc = windows.ntdll.NtQueryInformationFile(self.handle, &io_status_block, &info, @sizeOf(windows.FILE_STAT_INFORMATION), .FileStatInformation);
                 switch (rc) {
                     .SUCCESS => {},
                     // Buffer overflow here indicates that there is more information available than was able to be stored in the buffer
@@ -1033,30 +1023,13 @@ pub fn metadata(self: File) MetadataError!Metadata {
                     else => return windows.unexpectedStatus(rc),
                 }
 
-                const reparse_tag: windows.DWORD = reparse_blk: {
-                    if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) {
-                        var tag_info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
-                        const tag_rc = windows.ntdll.NtQueryInformationFile(self.handle, &io_status_block, &tag_info, @sizeOf(windows.FILE_ATTRIBUTE_TAG_INFO), .FileAttributeTagInformation);
-                        switch (tag_rc) {
-                            .SUCCESS => {},
-                            // INFO_LENGTH_MISMATCH and ACCESS_DENIED are the only documented possible errors
-                            // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/d295752f-ce89-4b98-8553-266d37c84f0e
-                            .INFO_LENGTH_MISMATCH => unreachable,
-                            .ACCESS_DENIED => return error.AccessDenied,
-                            else => return windows.unexpectedStatus(rc),
-                        }
-                        break :reparse_blk tag_info.ReparseTag;
-                    }
-                    break :reparse_blk 0;
-                };
-
                 break :blk .{
-                    .attributes = info.BasicInformation.FileAttributes,
-                    .reparse_tag = reparse_tag,
-                    ._size = @as(u64, @bitCast(info.StandardInformation.EndOfFile)),
-                    .access_time = windows.fromSysTime(info.BasicInformation.LastAccessTime),
-                    .modified_time = windows.fromSysTime(info.BasicInformation.LastWriteTime),
-                    .creation_time = windows.fromSysTime(info.BasicInformation.CreationTime),
+                    .attributes = info.FileAttributes,
+                    .reparse_tag = info.ReparseTag,
+                    ._size = @as(u64, @bitCast(info.EndOfFile)),
+                    .access_time = windows.fromSysTime(info.LastAccessTime),
+                    .modified_time = windows.fromSysTime(info.LastWriteTime),
+                    .creation_time = windows.fromSysTime(info.CreationTime),
                 };
             },
             .linux => blk: {
