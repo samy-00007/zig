@@ -19,6 +19,10 @@ const native_endian = builtin.cpu.arch.endian();
 
 const debug_safety = false;
 
+// currently arbitrary
+// TODO: see if a better value can be found
+const DIVISION_SIZE_LIMIT = 20;
+
 /// Returns the number of limbs needed to store `scalar`, which must be a
 /// primitive integer value.
 /// Note: A comptime-known upper bound of this value that may be used
@@ -31,6 +35,51 @@ pub fn calcLimbLen(scalar: anytype) usize {
 
     const w_value = @abs(scalar);
     return @as(usize, @intCast(@divFloor(@as(Limb, @intCast(math.log2(w_value))), limb_bits) + 1));
+}
+
+// see div_r_s for the source of the algorithm
+fn calcDivRSBufferLen(A: Const, B: Const) usize {
+    const s = B.limbs.len;
+    // 1.
+    const k = @as(usize, @intFromFloat(std.math.log2(@as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(DIVISION_SIZE_LIMIT))))) + 1;
+    const m = std.math.pow(usize, 2, k);
+
+    std.debug.assert(std.math.pow(usize, 2, k) * DIVISION_SIZE_LIMIT > s);
+    std.debug.assert(std.math.pow(usize, 2, k - 1) * DIVISION_SIZE_LIMIT <= s);
+
+    // 2.
+    const j: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(m))));
+    const n = j * m;
+
+    // 3.
+    const sigma = n * limb_bits - B.bitCountAbs();
+
+    // 5.
+    const t = blk: {
+        // bit count of a after the shift
+        const new_bit_count = A.bitCountAbs() + sigma;
+        // limb count of a after the shift
+        const limbs_len = new_bit_count / limb_bits + @intFromBool(new_bit_count % limb_bits != 0);
+        // upper part of the most significant byte of A after the shift
+        // we only care about its leftmost bit, so no need for its lower part
+        const leftmost_byte = A.limbs[A.limbs.len - 1] << @intCast(sigma % limb_bits);
+        const l = limbs_len / n;
+        const rem = limbs_len % n;
+        if (rem == 0)
+            break :blk if (leftmost_byte >> (@bitSizeOf(Limb) - 1) == 1)
+                l + 1 // A >= β^(n*l) / 2
+            else
+                l;
+        break :blk l + 1;
+    };
+
+    return 2 * t * n;
+}
+
+fn calcDivQLimbsBufferLen(a_len: usize, b_len: usize) usize {
+    if (a_len < b_len)
+        return 0;
+    return a_len - b_len + 1;
 }
 
 pub fn calcToStringLimbsBufferLen(a_len: usize, base: u8) usize {
@@ -943,19 +992,18 @@ pub const Mutable = struct {
     /// The upper bound for r limb count is `b.limbs.len`.
     /// The upper bound for q limb count is given by `a.limbs`.
     ///
-    /// `limbs_buffer` is used for temporary storage. The amount required is given by `calcDivLimbsBufferLen`.
+    /// The size required for `limb_buffer` is given by `calcDivRSBufferLen`
+    /// `allocator` is used for the karatsuba multiplication algorithm and is strongly recommended
+    /// without it, this algorithm is slower than naive division for large numbers
     pub fn divFloor(
         q: *Mutable,
         r: *Mutable,
         a: Const,
         b: Const,
         limbs_buffer: []Limb,
+        allocator: ?Allocator,
     ) void {
-        const sep = a.limbs.len + 2;
-        var x = a.toMutable(limbs_buffer[0..sep]);
-        var y = b.toMutable(limbs_buffer[sep..]);
-
-        div(q, r, &x, &y);
+        div_r_s(q, r, a, b, limbs_buffer, allocator);
 
         // Note, `div` performs truncating division, which satisfies
         // @divTrunc(a, b) * b + @rem(a, b) = a
@@ -1005,7 +1053,7 @@ pub const Mutable = struct {
             if (!r.eqlZero()) {
                 q.addScalar(q.toConst(), -1);
                 r.positive = true;
-                r.sub(r.toConst(), y.toConst().abs());
+                r.sub(r.toConst(), b.abs());
             }
         } else if (!a.positive and b.positive) {
             // -a/b -> q is negative, and so we need to fix flooring.
@@ -1036,7 +1084,7 @@ pub const Mutable = struct {
             if (!r.eqlZero()) {
                 q.addScalar(q.toConst(), -1);
                 r.positive = false;
-                r.add(r.toConst(), y.toConst().abs());
+                r.add(r.toConst(), b.abs());
             }
         } else if (!a.positive and !b.positive) {
             // a/b -> q is positive, don't need to do anything to fix flooring.
@@ -1070,19 +1118,18 @@ pub const Mutable = struct {
     /// The upper bound for r limb count is `b.limbs.len`.
     /// The upper bound for q limb count is given by `a.limbs.len`.
     ///
-    /// `limbs_buffer` is used for temporary storage. The amount required is given by `calcDivLimbsBufferLen`.
+    /// The size required for `limb_buffer` is given by `calcDivRSBufferLen`
+    /// `allocator` is used for the karatsuba multiplication algorithm and is strongly recommended
+    /// without it, this algorithm is slower than naive division for large numbers
     pub fn divTrunc(
         q: *Mutable,
         r: *Mutable,
         a: Const,
         b: Const,
         limbs_buffer: []Limb,
+        allocator: Allocator,
     ) void {
-        const sep = a.limbs.len + 2;
-        var x = a.toMutable(limbs_buffer[0..sep]);
-        var y = b.toMutable(limbs_buffer[sep..]);
-
-        div(q, r, &x, &y);
+        div_r_s(q, r, a, b, limbs_buffer, allocator);
     }
 
     /// r = a << shift, in other words, r = a * 2^shift
@@ -1534,8 +1581,98 @@ pub const Mutable = struct {
         result.copy(x.toConst());
     }
 
+    /// Fast Recursive Division (Christoph Burnikel and Joachim Ziegler)
+    /// Research Report MPI-I-98-1-022
+    ///
+    /// Algorithm 3 (D_r/s)
+    ///
+    /// A = QB + R
+    /// This function ignores the sign of A and B
+    ///
+    /// The size required for limb_buffer is given by `calcDivRSBufferLen`
+    /// `allocator` is used for the karatsuba multiplication algorithm and is strongly recommended
+    /// without it, this algorithm is slower than naive division for large numbers
+    ///
+    fn div_r_s(q: *Mutable, r: *Mutable, A: Const, B: Const, limb_buffer: []Limb, allocator: ?Allocator) void {
+        const s = B.limbs.len;
+        // 1.
+        const k = @as(usize, @intFromFloat(std.math.log2(@as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(DIVISION_SIZE_LIMIT))))) + 1;
+        const m = std.math.pow(usize, 2, k);
+
+        std.debug.assert(std.math.pow(usize, 2, k) * DIVISION_SIZE_LIMIT > s);
+        std.debug.assert(std.math.pow(usize, 2, k - 1) * DIVISION_SIZE_LIMIT <= s);
+
+        // 2.
+        const j: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(m))));
+        const n = j * m;
+
+        // 3.
+        const sigma = n * limb_bits - B.bitCountAbs();
+
+        // 5.
+        // actually done before 4. so we only allocate once
+        const t = blk: {
+            // bit count of a after the shift
+            const new_bit_count = A.bitCountAbs() + sigma;
+            // limb count of a after the shift
+            const limbs_len = new_bit_count / limb_bits + @intFromBool(new_bit_count % limb_bits != 0);
+            // upper part of the most significant byte of A after the shift
+            // we only care about its leftmost bit, so no need for its lower part
+            const leftmost_byte = A.limbs[A.limbs.len - 1] << @intCast(sigma % limb_bits);
+            const l = limbs_len / n;
+            const rem = limbs_len % n;
+            if (rem == 0)
+                break :blk if (leftmost_byte >> (@bitSizeOf(Limb) - 1) == 1)
+                    l + 1 // A >= β^(n*l) / 2
+                else
+                    l;
+            break :blk l + 1;
+        };
+
+        std.debug.assert(limb_buffer.len >= 2 * t * n);
+
+        const B_limbs = limb_buffer[0..n];
+        @memcpy(B_limbs[0..B.limbs.len], B.limbs);
+        @memset(B_limbs[B.limbs.len..], 0);
+
+        var R = limb_buffer[n .. n + t * n];
+        @memcpy(R[0..A.limbs.len], A.limbs);
+        @memset(R[A.limbs.len..], 0);
+
+        // we could directly use q.limbs for Q
+        // but Q in general bigger than A, i think
+        const Q = limb_buffer[n + t * n .. 2 * t * n]; // 2t*n = n + t*n + (t-1)*n
+        @memset(Q, 0);
+
+        // 4.
+        llshl(R, R[0..A.limbs.len], sigma);
+        llshl(B_limbs, B_limbs[0..B.limbs.len], sigma);
+
+        // 8.
+        var i: usize = t - 2;
+        while (i > 0) : (i -= 1) {
+            const Z = R[i * n .. (i + 2) * n];
+            // Ri is written in Z[0..n], which will be Z[n..2n] at the next iteration
+            div_2n_1n(allocator, Q[i * n .. (i + 1) * n], Z, B_limbs);
+        }
+        const Z = R[0 .. 2 * n];
+        div_2n_1n(allocator, Q[0..n], Z, B_limbs);
+
+        // 9.
+        llshr(R[0..n], R[0..n], sigma);
+
+        const R0_ = R[0 .. n - sigma / limb_bits];
+        const R0 = R0_[0..llnormalize(R0_)];
+        @memcpy(r.limbs[0..R0.len], R0);
+        r.len = R0.len;
+
+        const Q0 = Q[0..llnormalize(Q)];
+        @memcpy(q.limbs[0..Q0.len], Q0);
+        q.len = Q0.len;
+    }
+
     // Truncates by default.
-    fn div(q: *Mutable, r: *Mutable, x: *Mutable, y: *Mutable) void {
+    fn divNaive(q: *Mutable, r: *Mutable, x: *Mutable, y: *Mutable) void {
         assert(!y.eqlZero()); // division by zero
         assert(q != r); // illegal aliasing
 
@@ -3097,9 +3234,9 @@ pub const Managed = struct {
         try r.ensureCapacity(b.len());
         var mq = q.toMutable();
         var mr = r.toMutable();
-        const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
+        const limbs_buffer = try q.allocator.alloc(Limb, calcDivRSBufferLen(a.toConst(), b.toConst()));
         defer q.allocator.free(limbs_buffer);
-        mq.divFloor(&mr, a.toConst(), b.toConst(), limbs_buffer);
+        mq.divFloor(&mr, a.toConst(), b.toConst(), limbs_buffer, q.allocator);
         q.setMetadata(mq.positive, mq.len);
         r.setMetadata(mr.positive, mr.len);
     }
@@ -3114,9 +3251,9 @@ pub const Managed = struct {
         try r.ensureCapacity(b.len());
         var mq = q.toMutable();
         var mr = r.toMutable();
-        const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
+        const limbs_buffer = try q.allocator.alloc(Limb, calcDivRSBufferLen(a.toConst(), b.toConst()));
         defer q.allocator.free(limbs_buffer);
-        mq.divTrunc(&mr, a.toConst(), b.toConst(), limbs_buffer);
+        mq.divTrunc(&mr, a.toConst(), b.toConst(), limbs_buffer, q.allocator);
         q.setMetadata(mq.positive, mq.len);
         r.setMetadata(mr.positive, mr.len);
     }
@@ -3597,25 +3734,25 @@ fn llmulaccLong(comptime op: AccOp, r: []Limb, a: []const Limb, b: []const Limb)
     }
 }
 
-/// r = r (op) y * xi
+/// acc = acc (op) (y * xi << y_offset * limb_bits)
 /// The result is computed modulo `r.len`.
 /// Returns whether the operation overflowed.
-fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
+fn llmulLimbOffset(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb, y_offset: usize) bool {
     @setRuntimeSafety(debug_safety);
     if (xi == 0) {
         return false;
     }
 
-    const split = @min(y.len, acc.len);
+    const split = @min(y_offset + y.len, acc.len);
     var a_lo = acc[0..split];
     var a_hi = acc[split..];
 
     switch (op) {
         .add => {
             var carry: Limb = 0;
-            var j: usize = 0;
+            var j: usize = y_offset;
             while (j < a_lo.len) : (j += 1) {
-                a_lo[j] = addMulLimbWithCarry(a_lo[j], y[j], xi, &carry);
+                a_lo[j] = addMulLimbWithCarry(a_lo[j], y[j - y_offset], xi, &carry);
             }
 
             j = 0;
@@ -3629,9 +3766,9 @@ fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
         },
         .sub => {
             var borrow: Limb = 0;
-            var j: usize = 0;
+            var j: usize = y_offset;
             while (j < a_lo.len) : (j += 1) {
-                a_lo[j] = subMulLimbWithBorrow(a_lo[j], y[j], xi, &borrow);
+                a_lo[j] = subMulLimbWithBorrow(a_lo[j], y[j - y_offset], xi, &borrow);
             }
 
             j = 0;
@@ -3644,6 +3781,13 @@ fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
             return borrow != 0;
         },
     }
+}
+
+/// r = r (op) y * xi
+/// The result is computed modulo `r.len`.
+/// Returns whether the operation overflowed.
+fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
+    return llmulLimbOffset(op, acc, y, xi, 0);
 }
 
 /// returns the min length the limb could be.
@@ -3661,17 +3805,21 @@ fn llnormalize(a: []const Limb) usize {
 }
 
 /// Knuth 4.3.1, Algorithm S.
-fn llsubcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
+/// modified to perform r = a - (b << k * limb_bits)
+fn llsubcarryOffsetRight(r: []Limb, a: []const Limb, b: []const Limb, k: usize) Limb {
     @setRuntimeSafety(debug_safety);
     assert(a.len != 0 and b.len != 0);
-    assert(a.len >= b.len);
+    assert(a.len >= k + b.len);
     assert(r.len >= a.len);
 
     var i: usize = 0;
     var borrow: Limb = 0;
 
-    while (i < b.len) : (i += 1) {
-        const ov1 = @subWithOverflow(a[i], b[i]);
+    while (i < k) : (i += 1) {
+        r[i] = a[i];
+    }
+    while (i < k + b.len) : (i += 1) {
+        const ov1 = @subWithOverflow(a[i], b[i - k]);
         r[i] = ov1[0];
         const ov2 = @subWithOverflow(r[i], borrow);
         r[i] = ov2[0];
@@ -3686,25 +3834,39 @@ fn llsubcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
 
     return borrow;
 }
+/// Knuth 4.3.1, Algorithm S.
+fn llsubcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
+    return llsubcarryOffsetRight(r, a, b, 0);
+}
+
+// r = a - (b << k * limb_bits)
+fn llsubOffsetRight(r: []Limb, a: []const Limb, b: []const Limb, k: usize) void {
+    @setRuntimeSafety(debug_safety);
+    assert(a.len > k + b.len or (a.len == k + b.len and a[a.len - 1] >= b[b.len - 1]));
+    assert(llsubcarryOffsetRight(r, a, b, k) == 0);
+}
 
 fn llsub(r: []Limb, a: []const Limb, b: []const Limb) void {
-    @setRuntimeSafety(debug_safety);
-    assert(a.len > b.len or (a.len == b.len and a[a.len - 1] >= b[b.len - 1]));
-    assert(llsubcarry(r, a, b) == 0);
+    return llsubOffsetRight(r, a, b, 0);
 }
 
 /// Knuth 4.3.1, Algorithm A.
-fn lladdcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
+/// modified to perform r = a + (b << k * limb_bits)
+pub fn lladdcarryOffsetRight(r: []Limb, a: []const Limb, b: []const Limb, k: usize) Limb {
     @setRuntimeSafety(debug_safety);
     assert(a.len != 0 and b.len != 0);
-    assert(a.len >= b.len);
+    assert(a.len >= k + b.len);
     assert(r.len >= a.len);
 
     var i: usize = 0;
     var carry: Limb = 0;
 
-    while (i < b.len) : (i += 1) {
-        const ov1 = @addWithOverflow(a[i], b[i]);
+    while (i < k) : (i += 1) {
+        r[i] = a[i];
+    }
+
+    while (i < k + b.len) : (i += 1) {
+        const ov1 = @addWithOverflow(a[i], b[i - k]);
         r[i] = ov1[0];
         const ov2 = @addWithOverflow(r[i], carry);
         r[i] = ov2[0];
@@ -3720,10 +3882,19 @@ fn lladdcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
     return carry;
 }
 
-fn lladd(r: []Limb, a: []const Limb, b: []const Limb) void {
+pub fn lladdOffsetRight(r: []Limb, a: []const Limb, b: []const Limb, k: usize) void {
     @setRuntimeSafety(debug_safety);
     assert(r.len >= a.len + 1);
-    r[a.len] = lladdcarry(r, a, b);
+    r[a.len] = lladdcarryOffsetRight(r, a, b, k);
+}
+
+/// Knuth 4.3.1, Algorithm A.
+fn lladdcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
+    return lladdcarryOffsetRight(r, a, b, 0);
+}
+
+fn lladd(r: []Limb, a: []const Limb, b: []const Limb) void {
+    return lladdcarryOffsetRight(r, a, b, 0);
 }
 
 /// Knuth 4.3.1, Exercise 16.
@@ -4249,6 +4420,224 @@ fn fixedIntFromSignedDoubleLimb(A: SignedDoubleLimb, storage: []Limb) Mutable {
         .positive = A_is_positive,
         .len = 2,
     };
+}
+
+/// Modern Computer Arithmetic
+/// Algorithm 1.6 (BasecaseDivRem)
+///
+/// A = QB + R
+///
+/// Preconditions:
+///  - Q must be at least of len `calculateLenQ(A.len, B.len)` with A and B normalized (no trailing null limbs)
+///  - Q must be full of 0
+///  - B must be normalized (β^n / 2 <= B < β^n)
+///    if it is not, then shift B left to have it normalized and A by the same amount
+///    then at the end, shift right R by the same amount (no need to shift Q)
+///
+/// A is used as temporary buffer and output
+/// At the end, A = R
+///
+/// if strict is false, then the caller know q will take at most m limbs (used in div_2n_1n)
+///
+/// This function is slightly slower than Mutable.divNaive
+fn basecaseDivRem(Q: []Limb, A: []Limb, B: []const Limb, strict: bool) void {
+    std.debug.assert(B[B.len - 1] >> (limb_bits - 1) == 1); // ensure B is normalized
+
+    // trivial cases (A = B and A < B)
+    const order = llcmp(A, B);
+    if (order == 0) {
+        // A = B
+        // Q = 1, R = 0
+        Q[0] = 1;
+        @memset(A, 0);
+        return;
+    }
+    if (order == -1) {
+        // A < B
+        // Q = 0, R = A
+        return;
+    }
+
+    const n = B.len;
+    const m = A.len - n;
+    if (strict)
+        std.debug.assert(Q.len >= m + 1)
+    else
+        // used when the caller knows that Q will fit in m limbs (e.g. in div_2n_1n)
+        std.debug.assert(Q.len >= m);
+
+    // 1.
+    // A >= (B << m * limb_bits)  iff  (A >> m*bits) >= B
+    // so instead of checking A >= (B << m * limb_bits)
+    // we check (A >> m*bits) >= B
+    if (llcmp(A[m..], B) != -1) {
+        Q[m] = 1;
+        llsubOffsetRight(A, A, B, m);
+    }
+
+    for (0..m) |i| {
+        const j = m - 1 - i;
+
+        const TripleLimb = std.meta.Int(.unsigned, 3 * limb_bits);
+
+        // 3.
+        // when we can, we calculate a higher quality Qj
+        // this reduce the probability of A being negative after the next step
+        // see exercise 1.20
+        // TODO: can we move the if statement outside the loop ?
+        const Q_limb_j = if (A.len > 3 and B.len > 1)
+            std.mem.bytesToValue(TripleLimb, A[n + j - 2 .. n + j + 1]) / std.mem.bytesToValue(DoubleLimb, B[n - 2 .. n])
+        else
+            std.mem.bytesToValue(DoubleLimb, A[n + j - 1 .. n + j + 1]) / B[n - 1];
+        // 4.
+        const qj: Limb = @min(Q_limb_j, std.math.maxInt(Limb));
+        Q[j] = qj;
+
+        // 5.
+        // if llmulLimbOffset underflows, A is negative
+        var A_is_negative = llmulLimbOffset(.sub, A, B, qj, j);
+
+        while (A_is_negative) {
+            Q[j] -= 1;
+            // step 8
+            // while A is negative, it is in twos complement
+            // once it becomes positive, the addition overflows
+            A_is_negative = lladdcarryOffsetRight(A, A, B, j) == 0;
+        }
+    }
+}
+
+/// Fast Recursive Division (Christoph Burnikel and Joachim Ziegler)
+/// Research Report MPI-I-98-1-022
+///
+/// Algorithm 1 (D_2n/1n)
+/// similar to dividing 2 words by one word, but with big integers
+///
+/// A = QB + R
+///
+/// With β = 2^limb_bits and n = B.len
+/// Preconditions:
+///  - Q must of size n (or more, but useless) and be filled with zeros
+///  - A is at least of len 3n / 2 and at most 2n
+///  - B must be normalized (β^n / 2 <= B < β^n)
+///    if it is not, then shift B left to have it normalized and A by the same amount
+///    then at the end, shift right R by the same amount (no need to shift Q)
+///  - A < B * β^n
+///
+/// allocator is optional but strongly recommended since it enables karatsuba multiplication
+/// for large numbers, without allocator, naive division is way faster
+///
+/// A is used as temporary buffer and output
+/// At the end, R is written in A[0..n] (A[n..] is NOT filled with 0)
+// TODO: check if A is 0
+pub fn div_2n_1n(allocator: ?Allocator, Q: []Limb, A: []Limb, B: []const Limb) void {
+    const n = B.len;
+    const k = n / 2;
+
+    // some of the preconditions
+    assert(Q.len >= n);
+    assert(A.len <= 2 * n);
+    assert(A.len >= 3 * n / 2);
+    assert(B[B.len - 1] >> (limb_bits - 1) == 1); // ensure B is normalized
+
+    // 1.
+    // if n is odd or too small, use the naive division instead
+    // TODO: better basecase
+    if (n % 2 == 1 or n <= DIVISION_SIZE_LIMIT) {
+        // TODO: use the previous division algorithm ? it was slightly faster than this one
+        return basecaseDivRem(Q, A[0..llnormalize(A)], B, false);
+    }
+
+    // 2.
+    // done with slices
+
+    // AH is the 3 most significant quarter of A (most significant is at the left)
+    // AH = [A1,A2,A3]
+    const AH = A[k..];
+    // 3.
+    // div_3n_2n writes R1 in AH[0..2k] = AH[0..n]
+    div_3n_2n(allocator, Q[k..], AH, B);
+
+    // AL = [R1,A4]
+    const AL = A[0 .. 3 * k];
+    // 4.
+    // div_3n_2n writes R in AL[0..2k] = AL[0..n]
+    div_3n_2n(allocator, Q[0..k], AL, B);
+}
+
+/// Fast Recursive Division (Christoph Burnikel and Joachim Ziegler)
+/// Research Report MPI-I-98-1-022
+///
+/// Algorithm 2 (D_3n/2n)
+/// similar to dividing 3 words by 2 word, but with big integers
+///
+/// A = QB + R
+///
+/// With β = 2^limb_bits and n = B.len / 2
+/// Preconditions:
+///  - Q must of size n (or more, but useless) and be filled with zeros
+///  - A is at least of len 2n and at most 3n
+///  - B must be normalized (β^2n / 2 <= B < β^2n)
+///    if it is not, then shift B left to have it normalized and A by the same amount
+///    then at the end, shift right R by the same amount (no need to shift Q)
+///  - A < B * β^n
+///
+/// allocator is optional but strongly recommended since it enables karatsuba multiplication
+/// for large numbers, without allocator, naive division is way faster
+///
+/// A is used as temporary buffer and output
+/// At the end, R is written in A[0..2n] (A[2n..] is NOT filled with 0)
+// TODO: check if A is 0
+fn div_3n_2n(allocator: ?Allocator, Q: []Limb, A: []Limb, B: []const Limb) void {
+    const n = B.len / 2;
+
+    assert(B.len % 2 == 0);
+    assert(A.len >= 2 * n);
+    assert(A.len <= 3 * n);
+    assert(Q.len >= n);
+    assert(B[B.len - 1] >> (limb_bits - 1) == 1); // ensure B is normalized
+
+    // 1. and 2.
+    // done with slices
+
+    const A1 = A[2 * n ..];
+    const B1 = B[n..];
+    const R1 = A[n..];
+
+    // 3.
+    if (llcmp(A1, B1) == -1) {
+        // A1 < B1
+        div_2n_1n(allocator, Q, A[n..], B1);
+    } else {
+        // A1 >= B1
+
+        // Q = β^n - 1
+        Q[n - 1] = std.math.maxInt(Limb);
+        const underflows = llsubcarryOffsetRight(R1, R1, B1, n) != 0;
+        // TODO: not sure if necessary / true
+        std.debug.assert(!underflows);
+        _ = lladdcarry(R1, R1, B1);
+    }
+
+    // TODO: check if possible to use A[0..2*n] instead
+    const R = A[0..];
+
+    // 4. and 5.
+    // if Q == 0, we skip the multiplication
+    if (!(llnormalize(Q) == 1 and Q[0] == 0)) {
+        std.math.big.int.llmulacc(.sub, allocator, R, Q, B[0..n]);
+    }
+    // the leftmost bit of A is always 0 initially (TODO: really ?)
+    // if it is not anymore, then R has underflowed and is negative
+    var R_is_negative = R[R.len - 1] >> (limb_bits - 1) == 1;
+
+    // 6.
+    while (R_is_negative) {
+        // this addition overflows if R becomes positive
+        R_is_negative = lladdcarry(R, R, B) == 0;
+        // TODO: some form of llaccumsub ?
+        llsub(Q, Q, &[_]Limb{1});
+    }
 }
 
 test {
