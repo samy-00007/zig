@@ -721,7 +721,7 @@ pub const Mutable = struct {
 
         @memset(rma.limbs[0 .. a.limbs.len + b.limbs.len], 0);
 
-        llmulacc(.add, allocator, rma.limbs, a.limbs, b.limbs);
+        _ = llmulacc(.add, allocator, rma.limbs, a.limbs, b.limbs);
 
         rma.normalize(a.limbs.len + b.limbs.len);
         rma.positive = (a.positive == b.positive);
@@ -796,7 +796,7 @@ pub const Mutable = struct {
 
         @memset(rma.limbs[0..req_limbs], 0);
 
-        llmulacc(.add, allocator, rma.limbs, a_limbs, b_limbs);
+        _ = llmulacc(.add, allocator, rma.limbs[0..req_limbs], a_limbs, b_limbs);
         rma.normalize(@min(req_limbs, a.limbs.len + b.limbs.len));
         rma.positive = (a.positive == b.positive);
         rma.truncate(rma.toConst(), signedness, bit_count);
@@ -3129,8 +3129,9 @@ const AccOp = enum {
 /// r = r (op) a * b
 /// r MUST NOT alias any of a or b.
 ///
-/// The result is computed modulo `r.len`. When `r.len >= a.len + b.len`, no overflow occurs.
-fn llmulacc(comptime op: AccOp, opt_allocator: ?Allocator, r: []Limb, a: []const Limb, b: []const Limb) void {
+/// Returns whether the operation overflowed
+/// The result is computed modulo `r.len`.
+fn llmulacc(comptime op: AccOp, opt_allocator: ?Allocator, r: []Limb, a: []const Limb, b: []const Limb) bool {
     assert(r.len >= a.len);
     assert(r.len >= b.len);
     assert(!slicesOverlap(r, a));
@@ -3147,15 +3148,15 @@ fn llmulacc(comptime op: AccOp, opt_allocator: ?Allocator, r: []Limb, a: []const
     k_mul: {
         if (y.len > 48) {
             if (opt_allocator) |allocator| {
-                llmulaccKaratsuba(op, allocator, r, x, y) catch |err| switch (err) {
+                const ov = llmulaccKaratsuba(op, allocator, r, x, y) catch |err| switch (err) {
                     error.OutOfMemory => break :k_mul, // handled below
                 };
-                return;
+                return ov;
             }
         }
     }
 
-    llmulaccLong(op, r, x, y);
+    return llmulaccLong(op, r, x, y);
 }
 
 /// Knuth 4.3.1, Algorithm M.
@@ -3170,7 +3171,7 @@ fn llmulaccKaratsuba(
     r: []Limb,
     a: []const Limb,
     b: []const Limb,
-) error{OutOfMemory}!void {
+) error{OutOfMemory}!bool {
     assert(r.len >= a.len);
     assert(a.len >= b.len);
     assert(!slicesOverlap(r, a));
@@ -3211,6 +3212,7 @@ fn llmulaccKaratsuba(
     // This function computes the result of the multiplication modulo r.len. This means:
     // - p2 and p1 only need to be computed modulo r.len - B.
     // - In the case of p2, p2 * B^2 needs to be added modulo r.len - 2 * B.
+    var overflow = false;
 
     const split = b.len / 2; // B
 
@@ -3252,29 +3254,29 @@ fn llmulaccKaratsuba(
     const p2_limbs = @min(limbs_after_split, a1.len + b1.len);
 
     @memset(tmp[0..p2_limbs], 0);
-    llmulacc(.add, allocator, tmp[0..p2_limbs], a1[0..@min(a1.len, p2_limbs)], b1[0..@min(b1.len, p2_limbs)]);
+    _ = llmulacc(.add, allocator, tmp[0..p2_limbs], a1[0..@min(a1.len, p2_limbs)], b1[0..@min(b1.len, p2_limbs)]);
     const p2 = tmp[0..llnormalize(tmp[0..p2_limbs])];
 
     // Add p2 * B to the result.
-    _ = llaccum(op, r[split..], p2);
+    overflow = llaccum(op, r[split..], p2) or overflow;
 
     // Add p2 * B^2 to the result if required.
     if (limbs_after_split2 > 0) {
-        _ = llaccum(op, r[split * 2 ..], p2[0..@min(p2.len, limbs_after_split2)]);
+        overflow = llaccum(op, r[split * 2 ..], p2[0..@min(p2.len, limbs_after_split2)]) or overflow;
     }
 
     // Compute p0.
     // Since a0.len, b0.len <= split and r.len >= split * 2, the full width of p0 needs to be computed.
     const p0_limbs = a0.len + b0.len;
     @memset(tmp[0..p0_limbs], 0);
-    llmulacc(.add, allocator, tmp[0..p0_limbs], a0, b0);
+    _ = llmulacc(.add, allocator, tmp[0..p0_limbs], a0, b0);
     const p0 = tmp[0..llnormalize(tmp[0..p0_limbs])];
 
     // Add p0 to the result.
-    _ = llaccum(op, r, p0);
+    overflow = llaccum(op, r, p0) or overflow;
 
     // Add p0 * B to the result. In this case, we may not need all of it.
-    _ = llaccum(op, r[split..], p0[0..@min(limbs_after_split, p0.len)]);
+    overflow = llaccum(op, r[split..], p0[0..@min(limbs_after_split, p0.len)]) or overflow;
 
     // Finally, compute and add p1.
     // From now on we only need `limbs_after_split` limbs for a0 and b0, since the result of the
@@ -3295,7 +3297,7 @@ fn llmulaccKaratsuba(
 
     if (j0_sign * j1_sign == 0) {
         // p1 is zero, we don't need to do any computation at all.
-        return;
+        return overflow;
     }
 
     @memset(tmp, 0);
@@ -3330,14 +3332,15 @@ fn llmulaccKaratsuba(
         // If j0 and j1 are both negative, we now have:
         // p1 = -j0 * -j1 = j0 * j1
         // In this case we can add p1 to the result using llmulacc.
-        llmulacc(op, allocator, r[split..], j0[0..llnormalize(j0)], j1[0..llnormalize(j1)]);
+        overflow = llmulacc(op, allocator, r[split..], j0[0..llnormalize(j0)], j1[0..llnormalize(j1)]) or overflow;
     } else {
         // In this case either j0 or j1 is negative, an we have:
         // p1 = -(j0 * j1)
         // Now we need to subtract instead of accumulate.
         const inverted_op = if (op == .add) .sub else .add;
-        llmulacc(inverted_op, allocator, r[split..], j0[0..llnormalize(j0)], j1[0..llnormalize(j1)]);
+        overflow = llmulacc(inverted_op, allocator, r[split..], j0[0..llnormalize(j0)], j1[0..llnormalize(j1)]) or overflow;
     }
+    return overflow;
 }
 
 // Provides assembly for `llaccum` for x86_64
@@ -3747,20 +3750,26 @@ pub fn llcmp(a: []const Limb, b: []const Limb) math.Order {
 }
 
 /// r = r (op) y * xi
-/// The result is computed modulo `r.len`. When `r.len >= a.len + b.len`, no overflow occurs.
-fn llmulaccLong(comptime op: AccOp, r: []Limb, a: []const Limb, b: []const Limb) void {
+/// returns whether the operation overflowed
+/// The result is computed modulo `r.len`.
+pub fn llmulaccLong(comptime op: AccOp, r: []Limb, a: []const Limb, b: []const Limb) bool {
     assert(r.len >= a.len);
     assert(a.len >= b.len);
 
     var i: usize = 0;
+    var overflow = false;
     while (i < b.len) : (i += 1) {
-        _ = llmulLimb(op, r[i..], a, b[i]);
+        overflow = llmulLimb(op, r[i..], a, b[i]) or overflow;
     }
+    return overflow;
 }
 
 /// r = r (op) y * xi
-/// The result is computed modulo `r.len`.
 /// Returns whether the operation overflowed.
+/// If y.len > acc.len, it assumes some of the remaining limbs are non-zero and always overflows
+//
+// usually, if y.len > acc.len, the caller wants a modular operation, and therefore does not care
+// about the overflow anyway
 fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
     assert(!slicesOverlap(acc, y) or @intFromPtr(acc.ptr) <= @intFromPtr(y.ptr));
 
@@ -3787,7 +3796,7 @@ fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
         if (carry != 0 and acc.len > y.len)
             carry = @intFromBool(llaccum(op, acc[y.len..], &.{carry}));
 
-        return carry != 0;
+        return carry != 0 or y.len > acc.len;
     }
 
     return llmulLimbGeneric(op, acc, y, xi);
@@ -4716,7 +4725,7 @@ fn llpow(r: []Limb, a: []const Limb, b: u32, tmp_limbs: []Limb) void {
         exp = ov[0];
         if (ov[1] != 0) {
             @memset(tmp2, 0);
-            llmulacc(.add, null, tmp2, tmp1[0..llnormalize(tmp1)], a);
+            _ = llmulacc(.add, null, tmp2, tmp1[0..llnormalize(tmp1)], a);
             mem.swap([]Limb, &tmp1, &tmp2);
         }
     }
