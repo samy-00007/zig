@@ -17,6 +17,10 @@ const Endian = std.builtin.Endian;
 const Signedness = std.builtin.Signedness;
 const native_endian = builtin.cpu.arch.endian();
 
+// value based only on a few tests, could probably be adjusted
+// it may also depend on the cpu
+const recursive_division_threshold = 100;
+
 /// Returns the number of limbs needed to store `scalar`, which must be a
 /// primitive integer value.
 /// Note: A comptime-known upper bound of this value that may be used
@@ -979,18 +983,12 @@ pub const Mutable = struct {
     /// The upper bound for q limb count is given by `a.limbs`.
     ///
     /// `limbs_buffer` is used for temporary storage. The amount required is given by `calcDivLimbsBufferLen`.
-    pub fn divFloor(
-        q: *Mutable,
-        r: *Mutable,
-        a: Const,
-        b: Const,
-        limbs_buffer: []Limb,
-    ) void {
+    pub fn divFloor(q: *Mutable, r: *Mutable, a: Const, b: Const, limbs_buffer: []Limb, opt_allocator: ?Allocator) void {
         const sep = a.limbs.len + 2;
         const x = a.toMutable(limbs_buffer[0..sep]);
         const y = b.toMutable(limbs_buffer[sep..]);
 
-        div(q, r, x, y);
+        div(q, r, x, y, opt_allocator);
 
         // Note, `div` performs truncating division, which satisfies
         // @divTrunc(a, b) * b + @rem(a, b) = a
@@ -1106,18 +1104,12 @@ pub const Mutable = struct {
     /// The upper bound for q limb count is given by `a.limbs.len`.
     ///
     /// `limbs_buffer` is used for temporary storage. The amount required is given by `calcDivLimbsBufferLen`.
-    pub fn divTrunc(
-        q: *Mutable,
-        r: *Mutable,
-        a: Const,
-        b: Const,
-        limbs_buffer: []Limb,
-    ) void {
+    pub fn divTrunc(q: *Mutable, r: *Mutable, a: Const, b: Const, limbs_buffer: []Limb, opt_allocator: ?Allocator) void {
         const sep = a.limbs.len + 2;
         const x = a.toMutable(limbs_buffer[0..sep]);
         const y = b.toMutable(limbs_buffer[sep..]);
 
-        div(q, r, x, y);
+        div(q, r, x, y, opt_allocator);
     }
 
     /// r = a << shift, in other words, r = a * 2^shift
@@ -1441,7 +1433,8 @@ pub const Mutable = struct {
         };
 
         while (true) {
-            t.divFloor(&rem, a, s.toConst(), limbs_buffer[buf_index..]);
+            // TODO: pass an allocator or remove the need for it in the division
+            t.divFloor(&rem, a, s.toConst(), limbs_buffer[buf_index..], null);
             t.add(t.toConst(), s.toConst());
             u.shiftRight(t.toConst(), 1);
 
@@ -1566,7 +1559,7 @@ pub const Mutable = struct {
     // Truncates by default.
     // Requires no aliasing between all variables
     // a must have the capacity to store a one limb shift
-    fn div(q: *Mutable, r: *Mutable, a: Mutable, b: Mutable) void {
+    fn div(q: *Mutable, r: *Mutable, a: Mutable, b: Mutable, opt_allocator: ?Allocator) void {
         if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
             assert(!b.eqlZero()); // division by zero
             assert(q != r); // illegal aliasing
@@ -1621,7 +1614,20 @@ pub const Mutable = struct {
             a_limbs[1] = result.r[0];
             a_limbs[0] = result.r[1];
         } else {
-            basecaseDivRem(q.limbs, a_limbs, b_limbs);
+            // Currently, an allocator is required to use karatsuba.
+            // Recursive division is only faster than the basecase division thanks to better
+            // multiplication algorithms. Without them, it is worse due to overhead, so we just
+            // default to the basecase
+            if (opt_allocator) |allocator| {
+                // if `B.limbs.len` < `recursive_division_threshold`, the recursiveDivRem calls from unbalancedDivision
+                // will always immediatly default to basecaseDivRem, so just using the basecase is faster
+                if (b_limbs.len < recursive_division_threshold)
+                    basecaseDivRem(q.limbs, a_limbs, b_limbs)
+                else
+                    unbalancedDivision(q.limbs, a_limbs, b_limbs, allocator);
+            } else {
+                basecaseDivRem(q.limbs, a_limbs, b_limbs);
+            }
         }
 
         // we have r < b, so there is at most b.len() limbs
@@ -2195,7 +2201,8 @@ pub const Const = struct {
             while (q.len >= 2) {
                 // Passing an allocator here would not be helpful since this division is destroying
                 // information, not creating it. [TODO citation needed]
-                q.divTrunc(&r, q.toConst(), b, rest_of_the_limbs_buf);
+                // passing an allocator is not useful since b is one limb, so it will use lldiv1
+                q.divTrunc(&r, q.toConst(), b, rest_of_the_limbs_buf, null);
 
                 var r_word = r.limbs[0];
                 var i: usize = 0;
@@ -2903,7 +2910,7 @@ pub const Managed = struct {
         var mr = r.toMutable();
         const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
         defer q.allocator.free(limbs_buffer);
-        mq.divFloor(&mr, a.toConst(), b.toConst(), limbs_buffer);
+        mq.divFloor(&mr, a.toConst(), b.toConst(), limbs_buffer, q.allocator);
         q.setMetadata(mq.positive, mq.len);
         r.setMetadata(mr.positive, mr.len);
     }
@@ -2920,7 +2927,7 @@ pub const Managed = struct {
         var mr = r.toMutable();
         const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
         defer q.allocator.free(limbs_buffer);
-        mq.divTrunc(&mr, a.toConst(), b.toConst(), limbs_buffer);
+        mq.divTrunc(&mr, a.toConst(), b.toConst(), limbs_buffer, q.allocator);
         q.setMetadata(mq.positive, mq.len);
         r.setMetadata(mr.positive, mr.len);
     }
@@ -3942,6 +3949,121 @@ fn lladd(r: []Limb, a: []const Limb, b: []const Limb) void {
     r[a.len] = lladdcarry(r, a, b);
 }
 
+/// Algorithm UnbalancedDivision from "Modern Computer Arithmetic" by Richard P. Brent and Paul Zimmermann
+///
+/// `q` = `a` / `b` rem `r`
+///
+/// Normalization and unnormalization steps are handled by the caller.
+/// `r` is written in `a[0..b.len]` (`a[b.len..]` is NOT zeroed out).
+/// The most significant limbs of `a` (input) can be zeroes.
+///
+/// requires:
+/// - `b.len` >= 2
+/// - `a.len` >= 3
+/// - `a.len` >= `b.len`
+/// - `b` must be normalized (most significant bit of `b[b.len - 1]` must be set)
+/// - `q.len >= calcDivQLenExact(a, b)` (the quotient must be able to fit in `q`)
+///   a valid bound for q can be obtained more cheaply using `calcDivQLen`
+/// - no overlap between q, a and b
+fn unbalancedDivision(q: []Limb, a: []Limb, b: []const Limb, allocator: std.mem.Allocator) void {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+        assert(!slicesOverlap(q, a));
+        assert(!slicesOverlap(q, b));
+        assert(!slicesOverlap(a, b));
+        assert(b.len >= 2);
+        assert(a.len >= 3);
+        assert(a.len >= b.len);
+        assert(q.len >= calcDivQLenExact(a, b));
+        // b must be normalized
+        assert(@clz(b[b.len - 1]) == 0);
+    }
+    const n = b.len;
+    var m = a.len - b.len;
+
+    // We slightly deviate from the paper, by allowing `m <= n`, and, instead of doing a division after
+    // the loop, we do it before, in case the quotient takes up m - n + 1 Limbs.
+    // For the next loops, the quotient is always guaranteed to fit in n Limbs.
+    //
+    // `q.len` may be only m limbs instead of m + 1 if the caller know the result will fit
+    // (which has already been asserted).
+    const k = m % n;
+    recursiveDivRem(q[m - k .. @min(m + 1, q.len)], a[m - k .. m + n], b, allocator);
+    m -= k;
+
+    while (m > 0) {
+        // At each loop, we divide <r, a[m - n .. m]> by `b`, with r = a[m .. m + n],
+        // the remainder from the previous loop. This is effectively a 2 word by 1 word division,
+        // except each word is n Limbs long. The process is analogous to `lldiv1`.
+        //
+        // The quotient is guaranteed to fit in `n` Limbs since r < b (from the previous iteration).
+        recursiveDivRem(q[m - n .. m], a[m - n .. m + n], b, allocator);
+        m -= n;
+    }
+}
+
+/// Algorithm RecursiveDivRem from "Modern Computer Arithmetic" by Richard P. Brent and Paul Zimmermann
+///
+/// `q` = `a` / `b` rem `r`
+///
+/// Normalization and unnormalization steps are handled by the caller.
+/// `r` is written in `a[0..b.len]` (`a[b.len..]` is NOT zeroed out).
+/// The most significant limbs of `a` (input) can be zeroes.
+///
+/// requires:
+/// - `b.len` >= 2
+/// - `a.len` >= 3
+/// - `a.len` >= `b.len` and 2 * `b.len` >= `a.len`
+/// - `b` must be normalized (most significant bit of `b[b.len - 1]` must be set)
+/// - `q.len >= calcDivQLenExact(a, b)` (the quotient must be able to fit in `q`)
+///   a valid bound for q can be obtained more cheaply using `calcDivQLen`
+/// - no overlap between q, a and b
+fn recursiveDivRem(q: []Limb, a: []Limb, b: []const Limb, allocator: std.mem.Allocator) void {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+        assert(!slicesOverlap(q, a));
+        assert(!slicesOverlap(q, b));
+        assert(!slicesOverlap(a, b));
+        assert(b.len >= 2);
+        assert(a.len >= 3);
+        assert(a.len >= b.len);
+        // n >= m
+        assert(2 * b.len >= a.len);
+        assert(q.len >= std.math.big.int.calcDivQLenExact(a, b));
+        // b must be normalized
+        assert(@clz(b[b.len - 1]) == 0);
+    }
+
+    const n = b.len;
+    const m = a.len - n;
+
+    if (m < recursive_division_threshold) return basecaseDivRem(q, a, b);
+
+    const k = m / 2;
+
+    const b0 = b[0..k];
+    const b1 = b[k..];
+    const q1 = q[k..@min(q.len, m + 1)];
+    const q0 = q[0..k];
+
+    // It is possible to reduce the probability of `a_is_negative`
+    // by adding a Limb to a[2*k..] and b[k..]. In practice, I did not
+    // see any meaningful speed difference
+    recursiveDivRem(q1, a[2 * k ..], b1, allocator);
+    var a_is_negative = llmulacc(.sub, allocator, a[k..], q1, b0);
+
+    while (a_is_negative) {
+        _ = llaccum(.sub, q1, &.{1});
+        a_is_negative = !llaccum(.add, a[k..], b);
+    }
+
+    recursiveDivRem(q0, a[k..][0..n], b1, allocator);
+    a_is_negative = llmulacc(.sub, allocator, a, q0, b0);
+
+    while (a_is_negative) {
+        _ = llaccum(.sub, q0, &.{1});
+        a_is_negative = !llaccum(.add, a, b);
+    }
+}
+
 /// Algorithm BasecaseDivRem from "Modern Computer Arithmetic" by Richard P. Brent and Paul Zimmermann
 /// modified to use Algorithm 5 from "Improved division by invariant integers"
 /// by Niels Möller and Torbjörn Granlund
@@ -3970,6 +4092,7 @@ fn basecaseDivRem(q: []Limb, a: []Limb, b: []const Limb) void {
         assert(b.len >= 2);
         assert(a.len >= 3);
         assert(q.len >= calcDivQLenExact(a, b));
+        assert(a.len >= b.len);
         // b must be normalized
         assert(@clz(b[b.len - 1]) == 0);
     }
